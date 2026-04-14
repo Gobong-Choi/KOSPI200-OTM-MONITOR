@@ -52,3 +52,8 @@ if not df.empty:
         print("이번 달 리밸런싱일 데이터를 찾을 수 없습니다.")
 else:
     print("현재 지수 데이터를 가져오지 못했습니다.")
+
+send_telegram("✅ 깃허브 감시 로직이 정상적으로 실행되었습니다!")
+
+if current_price >= target_price:
+    send_telegram(f"🚨 [KOSPI 200] 목표가 도달!\n현재가: {current_price:.2f}")
