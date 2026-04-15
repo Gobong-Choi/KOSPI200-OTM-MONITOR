@@ -11,7 +11,7 @@ st.title("📊 KOSPI 200 커버드콜 전략 조종석")
 # 2. 리밸런싱일(금요일) 계산 함수
 def get_rebalance_days(date_index):
     rebalance_dates = []
-    groups = date_index.to_series().groupby(pd.Grouper(freq='M'))
+    groups = date_index.to_series().groupby(pd.Grouper(freq='ME'))
     for _, group in groups:
         first_day = group.iloc[0].replace(day=1)
         w = first_day.weekday() 
