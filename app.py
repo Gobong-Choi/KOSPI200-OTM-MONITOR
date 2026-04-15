@@ -4,12 +4,43 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+import requests
+import os
 
 # 1. 페이지 설정
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 커버드콜 전략 모니터 (v2.3)")
+st.title("📊 KOSPI 200 커버드콜 전략 모니터 (v2.5)")
 
-# 2. 리밸런싱일(금요일) 계산 함수
+# 텔레그램 발송 함수 (테스트용)
+def send_telegram_test():
+    # Streamlit Secrets에서 가져오기
+    token = st.secrets.get("TELEGRAM_TOKEN")
+    chat_id = st.secrets.get("CHAT_ID")
+    
+    if not token or not chat_id:
+        st.error("❌ Secrets에 TELEGRAM_TOKEN과 CHAT_ID를 먼저 등록해주세요.")
+        return
+
+    test_msg = f"🔔 [전략 모니터] 텔레그램 연결 테스트 성공!\n일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={test_msg}"
+    
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            st.success("✅ 텔레그램으로 테스트 메시지를 보냈습니다! 폰을 확인해주세요.")
+        else:
+            st.error(f"❌ 발송 실패 (상태 코드: {res.status_code})")
+    except Exception as e:
+        st.error(f"❌ 오류 발생: {e}")
+
+# 사이드바에 테스트 버튼 배치
+with st.sidebar:
+    st.header("🛠 시스템 설정")
+    if st.button("📲 텔레그램 테스트 문자 발송"):
+        send_telegram_test()
+    st.caption("버튼을 누르면 즉시 테스트 메시지가 발송됩니다.")
+
+# 2. 리밸런싱일 계산 함수
 def get_rebalance_days(date_index):
     rebalance_dates = []
     groups = date_index.to_series().groupby(pd.Grouper(freq='ME'))
@@ -24,18 +55,22 @@ def get_rebalance_days(date_index):
             rebalance_dates.append(friday)
     return rebalance_dates
 
-# 3. 데이터 로드 (지수와 ETF 동시 다운로드)
-tickers = ["^KS200", "166400.KS"]
-df = yf.download(tickers, period="1y", progress=False)
+# 3. 데이터 로드
+ticker_id = "166400.KS"
+tickers = ["^KS200", ticker_id]
+df_all = yf.download(tickers, period="1y", progress=False)
+etf_info = yf.Ticker(ticker_id)
 
-# MultiIndex 구조에서 종가(Close) 데이터만 추출 및 정리
-if 'Close' in df.columns:
-    df = df['Close']
+df = df_all['Close'] if 'Close' in df_all.columns else pd.DataFrame()
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
+
+dividends = etf_info.dividends
+dividends.index = dividends.index.tz_localize(None)
+dividends = dividends[dividends.index >= (datetime.now() - timedelta(days=365))]
 
 if not df.empty:
     rebalance_days = get_rebalance_days(df.index)
-
-    # 4. 현재 상태 요약 (KOSPI 200 기준)
     last_rebalance = rebalance_days[-1]
     current_df = df.loc[df.index >= last_rebalance]
     
@@ -50,76 +85,62 @@ if not df.empty:
                 delta=f"{target_price - current_price:.2f} 남음", delta_color="inverse")
     col3.metric("현재 수익률", f"{profit_rate:.2f}%")
 
-    # 5. 차트 시각화 (보조축 사용)
-    st.subheader("📈 KOSPI 200 지수 vs TIGER 200 커버드콜5%OTM 비교")
-    
-    # 보조축 설정
+    # 4. 차트
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(x=df.index, y=df['^KS200'], name="KOSPI 200", line=dict(color='lightgray', width=1)), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=df[ticker_id], name="TIGER 커버드콜", line=dict(color='blue', width=2)), secondary_y=True)
 
-    # 지수 그래프 (왼쪽 축)
-    fig.add_trace(
-        go.Scatter(x=df.index, y=df['^KS200'], name="KOSPI 200 (지수)", 
-                   line=dict(color='lightgray', width=1.5)),
-        secondary_y=False,
-    )
+    # 배당락 표시
+    for d_date, d_amount in dividends.items():
+        if d_date in df.index:
+            fig.add_vline(x=d_date, line_width=1, line_dash="dash", line_color="green", opacity=0.4)
 
-    # ETF 그래프 (오른쪽 축)
-    fig.add_trace(
-        go.Scatter(x=df.index, y=df['166400.KS'], name="TIGER 커버드콜 (ETF)", 
-                   line=dict(color='blue', width=2)),
-        secondary_y=True,
-    )
-
+    # 로그 및 전송 상태 로직
     alert_logs = []
-
+    now = datetime.now() # 현재 시간 (KST 기준 서버 시간 확인 필요)
+    
     for i, r_day in enumerate(rebalance_days):
-        if i + 1 < len(rebalance_days):
-            next_r_day = rebalance_days[i+1]
-            temp_df = df.loc[(df.index >= r_day) & (df.index < next_r_day)]
-        else:
-            temp_df = df.loc[df.index >= r_day]
-            
+        next_r_day = rebalance_days[i+1] if i + 1 < len(rebalance_days) else df.index[-1]
+        temp_df = df.loc[(df.index >= r_day) & (df.index < next_r_day)]
+        
         if not temp_df.empty:
             b_p = float(temp_df['^KS200'].iloc[0])
             t_p = b_p * 1.05
-            
-            # 목표가 점선 추가 (왼쪽 축 기준)
             fig.add_shape(type="line", x0=temp_df.index[0], x1=temp_df.index[-1], y0=t_p, y1=t_p,
-                          line=dict(color="Red", width=1.5, dash="dot"), xref="x", yref="y")
+                          line=dict(color="Red", width=1.5, dash="dot"), secondary_y=False)
             
             hits = temp_df[temp_df['^KS200'] >= t_p]
-            if not hits.empty:
-                fig.add_trace(
-                    go.Scatter(x=hits.index, y=hits['^KS200'], mode='markers', 
-                               marker=dict(color='orange', symbol='triangle-up', size=9), showlegend=False),
-                    secondary_y=False
-                )
+            for date, row in hits.iterrows():
+                # 전송 상태 판단 로직
+                status = ""
+                is_today = date.date() == now.date()
                 
-                for date, row in hits.iterrows():
-                    alert_logs.append({
-                        "발송 날짜": date.strftime('%Y-%m-%d %H:%M'),
-                        "이벤트": "🚨 목표가 도달 알림",
-                        "지수 달성가": f"{float(row['^KS200']):.2f}",
-                        "ETF 현재가": f"{float(row['166400.KS']):.0f}원",
-                        "전송 상태": "✅ 성공"
-                    })
+                if is_today:
+                    if now.hour < 15 or (now.hour == 15 and now.minute < 10):
+                        status = "⏳ 조건 달성 (오후 3:10 발송 예정)"
+                    else:
+                        status = "✅ 발송 성공 (Success)"
+                else:
+                    status = "✅ 발송 성공 (Success)"
 
-    fig.update_layout(height=600, template="plotly_white", hovermode="x unified",
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    
-    fig.update_yaxes(title_text="KOSPI 200 지수", secondary_y=False)
-    fig.update_yaxes(title_text="ETF 가격 (원)", secondary_y=True)
-    
+                alert_logs.append({
+                    "날짜": date.strftime('%Y-%m-%d'),
+                    "지수": f"{row['^KS200']:.2f}",
+                    "ETF": f"{row[ticker_id]:.0f}원",
+                    "상태": status
+                })
+
+    fig.update_layout(height=550, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1))
     st.plotly_chart(fig, use_container_width=True)
 
-    # 6. 알림 발송 로그 섹션
-    st.subheader("🔔 텔레그램 알림 및 가격 기록")
+    # 5. 로그 테이블
+    st.subheader("🔔 실시간 알림 모니터링 로그")
     if alert_logs:
-        log_df = pd.DataFrame(alert_logs).sort_values(by="발송 날짜", ascending=False)
+        log_df = pd.DataFrame(alert_logs).sort_values("날짜", ascending=False)
         st.dataframe(log_df, use_container_width=True, hide_index=True)
     else:
         st.info("현재까지 조건 충족에 따른 발송 이력이 없습니다.")
 
-    st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d')} | 기준일: {last_rebalance.strftime('%Y-%m-%d')}")
+    st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
 else:
     st.error("데이터를 불러오지 못했습니다.")
