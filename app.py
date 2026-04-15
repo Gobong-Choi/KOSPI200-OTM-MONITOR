@@ -8,9 +8,8 @@ import pytz
 
 # 1. 페이지 설정 및 제목
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 전략 모니터 (v5.0 Master)")
+st.title("📊 KOSPI 200 전략 모니터 (v6.0)")
 
-# KST 시간대 정의 (대표님께서 제안하신 '꼬리표' 통일)
 KST = pytz.timezone('Asia/Seoul')
 SYSTEM_START_DATE = datetime(2026, 4, 14).date()
 
@@ -35,56 +34,46 @@ with st.sidebar:
     if st.button("📲 텔레그램 테스트 문자 발송"):
         send_telegram_test()
 
-# 2. 데이터 로드 및 '꼬리표(KST)' 통일 작업
+# 2. 데이터 로드 (캐시 처리)
 @st.cache_data(ttl=3600)
-def load_data_v5():
+def load_market_data():
     ticker_id = "166400.KS"
     tickers = ["^KS200", ticker_id]
     
-    # 데이터 다운로드
+    # 데이터 다운로드 및 시간대 제거 (에러 원천 차단)
     raw = yf.download(tickers, period="1y", progress=False)
-    
-    # 모든 데이터의 시간대를 KST로 통일 (꼬리표 붙이기)
-    if raw.index.tz is None:
-        raw.index = raw.index.tz_localize('UTC').tz_convert(KST)
-    else:
-        raw.index = raw.index.tz_convert(KST)
+    if not raw.empty:
+        raw.index = raw.index.tz_localize(None) # 시간대 꼬리표 완전 제거
         
     close_df = raw['Close'].copy()
     if isinstance(close_df.columns, pd.MultiIndex):
         close_df.columns = close_df.columns.get_level_values(0)
     
-    # 분배금 데이터 로드 및 꼬리표 통일
     etf = yf.Ticker(ticker_id)
     divs = etf.dividends
     if not divs.empty:
-        if divs.index.tz is None:
-            divs.index = divs.index.tz_localize('UTC').tz_convert(KST)
-        else:
-            divs.index = divs.index.tz_convert(KST)
-        divs.index = divs.index.normalize()
+        divs.index = divs.index.tz_localize(None).normalize()
         
     return close_df, divs, ticker_id
 
-df, dividends, ETF_TICKER = load_data_v5()
+df, dividends, ETF_TICKER = load_market_data()
 
-# 리밸런싱일 계산 함수
+# 리밸런싱일 계산 함수 (수학적 매칭)
 def get_rebalance_days(idx):
     r_dates = []
-    # 월별 그룹화 후 둘째 금요일 계산
     groups = idx.to_series().groupby(pd.Grouper(freq='ME'))
     for _, group in groups:
         if group.empty: continue
         d1 = group.iloc[0].replace(day=1)
         # 2nd Thu + 1 day = Friday
         w = d1.weekday()
-        first_thu = d1 + timedelta(days=((3 - w + 7) % 7))
-        sec_thu = first_thu + timedelta(days=7)
-        fri = sec_thu + timedelta(days=1)
+        target_fri = d1 + timedelta(days=((3 - w + 7) % 7) + 8)
         
-        # 실제 거래일 중 가장 가까운 날짜 찾기
-        target_idx = idx.get_indexer([fri], method='nearest')[0]
-        r_dates.append(idx[target_idx])
+        # [에러 방지] 단순 뺄셈으로 가장 가까운 날짜 찾기
+        idx_seconds = idx.view('int64') // 10**9
+        target_seconds = int(target_fri.timestamp())
+        closest_idx = (idx_seconds - target_seconds).abs().argmin()
+        r_dates.append(idx[closest_idx])
     return sorted(list(set(r_dates)))
 
 if not df.empty:
@@ -109,20 +98,17 @@ if not df.empty:
     c4.metric("기준지수대비", f"{profit:.2f}%")
 
     # 4. 차트 시각화
-    st.subheader("📈 지수 vs ETF 수익률 (KST 기준 및 분배락 표기)")
+    st.subheader("📈 지수 vs ETF 수익률 동기화 (분배락 표기)")
     fig = go.Figure()
-    logs, now_kst = [], datetime.now(KST)
+    logs, now_date = [], datetime.now().date()
 
     # 범례 고정
     fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', 
                              marker=dict(color='green', symbol='star', size=10), name='분배락일(★)'))
 
     for i, r_day in enumerate(re_days):
-        if i + 1 < len(re_days):
-            nxt = re_days[i+1]
-            tmp = df.loc[(df.index >= r_day) & (df.index < nxt)].copy()
-        else:
-            tmp = df.loc[df.index >= r_day].copy()
+        nxt = re_days[i+1] if i + 1 < len(re_days) else df.index[-1] + timedelta(days=1)
+        tmp = df.loc[(df.index >= r_day) & (df.index < nxt)].copy()
         
         if not tmp.empty:
             s_idx = float(tmp['^KS200'].iloc[0])
@@ -134,13 +120,15 @@ if not df.empty:
             fig.add_trace(go.Scatter(x=tmp.index, y=tmp['Adj'], name="TIGER 커버드콜", 
                                      line=dict(color='blue', width=1), showlegend=(i==0)))
             
-            # 분배락 표시 (모든 데이터가 KST 꼬리표를 달고 있어 안전함)
+            # [에러 해결] 분배락 표시 로직 (정수형 타임스탬프 비교로 100% 안전)
             if not dividends.empty:
                 d_in_seg = dividends[(dividends.index >= tmp.index[0]) & (dividends.index <= tmp.index[-1])]
                 for d_dt, _ in d_in_seg.items():
-                    # 가장 가까운 날짜 매칭
-                    idx_loc = tmp.index.get_indexer([d_dt], method='nearest')[0]
-                    target_dt = tmp.index[idx_loc]
+                    tmp_seconds = tmp.index.view('int64') // 10**9
+                    d_seconds = int(d_dt.timestamp())
+                    closest_dt_idx = (tmp_seconds - d_seconds).abs().argmin()
+                    target_dt = tmp.index[closest_dt_idx]
+                    
                     fig.add_vline(x=target_dt, line_width=1, line_dash="dot", line_color="green", opacity=0.6)
                     fig.add_trace(go.Scatter(x=[target_dt], y=[tmp.loc[target_dt, 'Adj']], mode='markers', 
                                              marker=dict(color='green', size=10, symbol='star'), showlegend=False))
@@ -155,15 +143,14 @@ if not df.empty:
                 fig.add_trace(go.Scatter(x=hits.index, y=hits['^KS200'].values, mode='markers', 
                                          marker=dict(color='orange', symbol='triangle-up', size=10), showlegend=False))
                 for dt, row in hits.iterrows():
-                    dt_date = dt.date()
-                    is_t = dt_date == now_kst.date()
-                    if dt_date < SYSTEM_START_DATE: st_val = "⚪ 미실행"
-                    elif is_t and now_kst.hour < 15: st_val = "⏳ 발송 예정"
+                    dt_d = dt.date()
+                    is_t = dt_d == now_date
+                    if dt_d < SYSTEM_START_DATE: st_val = "⚪ 미실행"
+                    elif is_t and datetime.now().hour < 15: st_val = "⏳ 발송 예정"
                     else: st_val = "✅ 발송 성공"
                     logs.append({"날짜": dt.strftime('%Y-%m-%d'), "지수": f"{row['^KS200']:.2f}", "상태": st_val})
 
-    fig.update_layout(height=550, template="plotly_white", hovermode="x unified", 
-                      legend=dict(orientation="h", y=1.1, x=1))
+    fig.update_layout(height=550, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.1, x=1))
     st.plotly_chart(fig, use_container_width=True)
 
     # 5. 하단 테이블
@@ -176,10 +163,8 @@ if not df.empty:
         if not dividends.empty:
             d_df = dividends.reset_index()
             d_df.columns = ['배당락일', '원']
-            # 보기 편하게 날짜 형식 변경
-            d_df['배당락일'] = d_df['배당락일'].dt.strftime('%Y-%m-%d')
             st.dataframe(d_df.sort_values('배당락일', ascending=False).head(10), use_container_width=True, hide_index=True)
 
-    st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d %H:%M')} (KST)")
+    st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
 else:
     st.error("데이터 로드 실패")
