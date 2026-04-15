@@ -7,7 +7,7 @@ import requests
 
 # 1. 페이지 설정
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 전략 모니터 (v3.5)")
+st.title("📊 KOSPI 200 전략 모니터 (v3.6)")
 
 SYSTEM_START_DATE = datetime(2026, 4, 14).date()
 
@@ -29,20 +29,26 @@ def send_telegram_test():
 # 2. 데이터 로드 및 전처리
 ticker_id = "166400.KS"
 tickers = ["^KS200", ticker_id]
-df_all = yf.download(tickers, period="1y", progress=False)
-etf_info = yf.Ticker(ticker_id)
 
-# 가격 데이터 정리
-df = df_all['Close'].copy()
-if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.get_level_values(0)
+# [중요] 데이터 로드 시 오류 방지를 위해 에러 핸들링 추가
+try:
+    df_all = yf.download(tickers, period="1y", progress=False)
+    etf_info = yf.Ticker(ticker_id)
+    
+    # 가격 데이터 정리
+    df = df_all['Close'].copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-# [핵심] 분배금 데이터 추출 및 정규화
-dividends = etf_info.dividends
-if not dividends.empty:
-    dividends.index = dividends.index.tz_localize(None).normalize()
-    # 최근 1년치만 필터링
-    dividends = dividends[dividends.index >= (datetime.now() - timedelta(days=365))]
+    # 분배금 데이터 추출 및 정규화
+    dividends = etf_info.dividends
+    if not dividends.empty:
+        dividends.index = pd.to_datetime(dividends.index).tz_localize(None).normalize()
+        dividends = dividends[dividends.index >= (datetime.now() - timedelta(days=365))]
+except Exception as e:
+    st.error(f"데이터 로드 중 오류 발생: {e}")
+    df = pd.DataFrame()
+    dividends = pd.Series()
 
 with st.sidebar:
     st.header("🛠 시스템 설정")
@@ -50,8 +56,6 @@ with st.sidebar:
     st.divider()
     st.subheader("📊 데이터 상태")
     st.write(f"분배금 데이터: {'✅ 로드됨' if not dividends.empty else '❌ 데이터 없음'}")
-    if not dividends.empty:
-        st.write(f"최근 분배일: {dividends.index[-1].strftime('%Y-%m-%d')}")
 
 # 리밸런싱일 계산 함수
 def get_rebalance_days(date_index):
@@ -93,7 +97,7 @@ if not df.empty:
     alert_logs = []
     now = datetime.now()
 
-    # 범례용 가짜 데이터 (항상 범례에 나오게 함)
+    # 범례 고정
     fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(color='green', symbol='star', size=10), name='분배락일(★)'))
 
     for i, r_day in enumerate(rebalance_days):
@@ -105,19 +109,18 @@ if not df.empty:
             s_etf = float(temp_df[ticker_id].iloc[0])
             temp_df['Adj_ETF'] = (temp_df[ticker_id] / s_etf) * s_idx
             
-            # 메인 선
             fig.add_trace(go.Scatter(x=temp_df.index, y=temp_df['^KS200'], name="KOSPI 200", line=dict(color='lightgray', width=1), showlegend=(i == 0)))
             fig.add_trace(go.Scatter(x=temp_df.index, y=temp_df['Adj_ETF'], name="TIGER 커버드콜", line=dict(color='blue', width=1), showlegend=(i == 0)))
             
-            # [수정] 분배락 표시 로직 (가장 가까운 거래일 매칭)
-            seg_div = dividends[(dividends.index >= temp_df.index[0]) & (dividends.index <= temp_df.index[-1])]
-            for d_date, _ in seg_div.items():
-                # 그래프 상의 날짜 중 가장 가까운 날짜 찾기
-                closest_date = temp_df.index[temp_df.index.get_indexer([d_date], method='nearest')[0]]
-                fig.add_vline(x=closest_date, line_width=1.5, line_dash="dot", line_color="rgba(0,128,0,0.8)")
-                fig.add_trace(go.Scatter(x=[closest_date], y=[temp_df.loc[closest_date, 'Adj_ETF']], mode='markers', marker=dict(color='green', size=12, symbol='star'), showlegend=False, hoverinfo='skip'))
+            # [수정] TypeError 해결: get_indexer 대신 수학적 최소값 비교 사용
+            if not dividends.empty:
+                seg_div = dividends[(dividends.index >= temp_df.index[0]) & (dividends.index <= temp_df.index[-1])]
+                for d_date, _ in seg_div.items():
+                    # 시간차이가 가장 적은 인덱스를 직접 찾음 (에러 원천 차단)
+                    closest_date = min(temp_df.index, key=lambda d: abs(d - d_date))
+                    fig.add_vline(x=closest_date, line_width=1.5, line_dash="dot", line_color="rgba(0,128,0,0.8)")
+                    fig.add_trace(go.Scatter(x=[closest_date], y=[temp_df.loc[closest_date, 'Adj_ETF']], mode='markers', marker=dict(color='green', size=12, symbol='star'), showlegend=False, hoverinfo='skip'))
             
-            # 목표선 및 삼각형
             t_p = s_idx * 1.05
             fig.add_shape(type="line", x0=temp_df.index[0], x1=temp_df.index[-1], y0=t_p, y1=t_p, line=dict(color="Red", width=1.2, dash="dot"))
             hits = temp_df[temp_df['^KS200'] >= t_p]
