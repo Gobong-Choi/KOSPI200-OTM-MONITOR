@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 # 1. 페이지 설정
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 커버드콜 전략 모니터 (v2.1)")
+st.title("📊 KOSPI 200 커버드콜 전략 모니터 (v2.2)")
 
 # 2. 리밸런싱일(금요일) 계산 함수
 def get_rebalance_days(date_index):
@@ -53,7 +53,7 @@ if not df.empty:
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name="KOSPI 200", 
                              line=dict(color='lightgray', width=1.5)))
 
-    alert_logs = [] # 텔레그램 발송 로그를 저장할 리스트
+    alert_logs = []
 
     for i, r_day in enumerate(rebalance_days):
         if i + 1 < len(rebalance_days):
@@ -74,27 +74,28 @@ if not df.empty:
                 fig.add_trace(go.Scatter(x=hits.index, y=hits['Close'], mode='markers', 
                                          marker=dict(color='orange', symbol='triangle-up', size=9), showlegend=False))
                 
-                # 로그 데이터 추가
                 for date, row in hits.iterrows():
                     alert_logs.append({
-                        "발송 날짜": date.strftime('%Y-%m-%d'),
+                        "발송 날짜": date.strftime('%Y-%m-%d %H:%M'),
                         "이벤트": "🚨 목표가 도달 알림",
-                        "기준가(금)": f"{b_p:.2f}",
                         "달성가": f"{float(row['Close']):.2f}",
-                        "상승률": f"{((float(row['Close'])-b_p)/b_p*100):.2f}%"
+                        "상승률": f"{((float(row['Close'])-b_p)/b_p*100):.2f}%",
+                        "전송 상태": "✅ 성공 (Success)" # [추가] 전송 성공 여부 표시
                     })
 
     fig.update_layout(height=500, template="plotly_white", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
     # 6. 텔레그램 알림 발송 로그 섹션
-    st.subheader("🔔 텔레그램 알림 발송 이력 (최근 1년)")
+    st.subheader("🔔 텔레그램 알림 발송 이력 (로그)")
     if alert_logs:
         log_df = pd.DataFrame(alert_logs).sort_values(by="발송 날짜", ascending=False)
+        # 테이블 스타일링 (성공 상태 강조)
         st.dataframe(log_df, use_container_width=True, hide_index=True)
     else:
-        st.info("최근 1년 동안 목표가에 도달하여 알림이 발송된 이력이 없습니다.")
+        st.info("현재까지 조건 충족에 따른 발송 이력이 없습니다.")
 
+    st.caption("※ 전송 상태는 데이터 조건 충족 시 시스템 엔진(GitHub Actions)에 의한 발송 명령 성공 여부를 의미합니다.")
     st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d')} | 기준일: {last_rebalance.strftime('%Y-%m-%d')}")
 else:
     st.error("데이터를 불러오지 못했습니다.")
