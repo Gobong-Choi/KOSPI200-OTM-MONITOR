@@ -7,69 +7,78 @@ import requests
 
 # 1. 페이지 설정 및 제목
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 전략 모니터 (v8.0 Master)")
+st.title("📊 KOSPI 200 전략 모니터 (최종 안정화 버전)")
 
-# 시스템 가동일 설정
+# 시스템 가동일 설정 (2026-04-14)
 SYSTEM_START_DATE = datetime(2026, 4, 14).date()
 
-# 텔레그램 테스트 함수
+# 텔레그램 테스트 함수 (사이드바)
 def send_telegram_test():
     token = st.secrets.get("TELEGRAM_TOKEN")
     chat_id = st.secrets.get("CHAT_ID")
     if not token or not chat_id:
-        st.error("❌ Secrets 설정을 확인해주세요.")
+        st.error("❌ Secrets 설정을 확인해주세요 (TELEGRAM_TOKEN, CHAT_ID)")
         return
-    msg = f"🔔 [전략 모니터] 테스트 성공!\n일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    msg = f"🔔 [전략 모니터] 테스트 성공!\n일시: {now_str}"
     url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={msg}"
     try:
         res = requests.get(url)
-        if res.status_code == 200: st.success("✅ 테스트 성공!")
-        else: st.error(f"❌ 실패 (코드: {res.status_code})")
-    except Exception as e: st.error(f"❌ 오류: {e}")
+        if res.status_code == 200:
+            st.success("✅ 텔레그램 발송 성공!")
+        else:
+            st.error(f"❌ 발송 실패 (코드: {res.status_code})")
+    except Exception as e:
+        st.error(f"❌ 오류 발생: {e}")
 
 with st.sidebar:
     st.header("🛠 시스템 설정")
-    if st.button("📲 텔레그램 테스트 문자 발송"): send_telegram_test()
+    if st.button("📲 텔레그램 테스트 문자 발송"):
+        send_telegram_test()
 
-# 2. 데이터 로드 및 전처리 (시간대 완전 제거)
+# 2. 데이터 로드 및 정제 (에러 원천 차단 로직)
 @st.cache_data(ttl=3600)
-def load_data_final():
+def load_data_v7():
     ticker_id = "166400.KS"
     tickers = ["^KS200", ticker_id]
-    raw = yf.download(tickers, period="1y", progress=False)
     
-    # 시간대 제거 및 날짜 정규화
+    # 데이터 다운로드 및 시간대(Timezone) 완전 제거
+    raw = yf.download(tickers, period="1y", progress=False)
+    if raw.empty: return pd.DataFrame(), pd.Series(), ticker_id
+    
+    # [핵심] 모든 데이터의 시간대 제거 및 날짜 정규화
     raw.index = pd.to_datetime(raw.index).tz_localize(None).normalize()
     
     close_df = raw['Close'].copy()
     if isinstance(close_df.columns, pd.MultiIndex):
         close_df.columns = close_df.columns.get_level_values(0)
     
-    info = yf.Ticker(ticker_id)
-    divs = info.dividends
+    # 분배금 데이터 로드 및 시간대 제거
+    etf = yf.Ticker(ticker_id)
+    divs = etf.dividends
     if not divs.empty:
         divs.index = pd.to_datetime(divs.index).tz_localize(None).normalize()
+        
     return close_df, divs, ticker_id
 
-df, dividends, ETF_TICKER = load_data_final()
+df, dividends, ETF_TICKER = load_data_v7()
 
-# 리밸런싱일 계산 (에러 발생 지점 - 가장 원시적인 방식으로 수정)
+# 리밸런싱일 계산 함수 (수동 매칭 방식)
 def get_rebalance_days(idx):
     r_dates = []
     groups = idx.to_series().groupby(pd.Grouper(freq='ME'))
-    idx_list = idx.to_list() # 연산을 위해 리스트로 변환
+    idx_list = idx.to_list()
     
     for _, group in groups:
         if group.empty: continue
         d1 = group.iloc[0].replace(day=1)
-        # 2nd Thu + 1 day = Friday
         w = d1.weekday()
+        # 2nd Thu + 1 day = Friday
         target_fri = d1 + timedelta(days=((3 - w + 7) % 7) + 8)
         
-        # [에러 해결] 판다스 함수 대신 수동 비교 (모든 환경에서 안전)
+        # 가장 가까운 실제 거래일 찾기
         closest_date = min(idx_list, key=lambda d: abs((d - target_fri).total_seconds()))
         r_dates.append(closest_date)
-        
     return sorted(list(set(r_dates)))
 
 if not df.empty:
@@ -77,6 +86,7 @@ if not df.empty:
     last_re = re_days[-1]
     curr_df = df.loc[df.index >= last_re]
     
+    # 상단 지표용 값 추출
     base_p = float(curr_df['^KS200'].iloc[0]) 
     curr_p = float(curr_df['^KS200'].iloc[-1])
     target_p = base_p * 1.05
@@ -110,15 +120,16 @@ if not df.empty:
             s_idx, s_etf = float(tmp['^KS200'].iloc[0]), float(tmp[ETF_TICKER].iloc[0])
             tmp['Adj'] = (tmp[ETF_TICKER] / s_etf) * s_idx
             
+            # 그래프 선
             fig.add_trace(go.Scatter(x=tmp.index, y=tmp['^KS200'], name="KOSPI 200", line=dict(color='lightgray', width=1), showlegend=(i==0)))
             fig.add_trace(go.Scatter(x=tmp.index, y=tmp['Adj'], name="TIGER 커버드콜", line=dict(color='blue', width=1), showlegend=(i==0)))
             
-            # 분배락 표시 (수동 매칭으로 에러 원천 차단)
+            # 분배락 표시 (수동 매칭)
             if not dividends.empty:
                 d_in_seg = dividends[(dividends.index >= tmp.index[0]) & (dividends.index <= tmp.index[-1])]
-                tmp_idx_list = tmp.index.to_list()
+                tmp_list = tmp.index.to_list()
                 for d_dt, _ in d_in_seg.items():
-                    target_dt = min(tmp_idx_list, key=lambda d: abs((d - d_dt).total_seconds()))
+                    target_dt = min(tmp_list, key=lambda d: abs((d - d_dt).total_seconds()))
                     fig.add_vline(x=target_dt, line_width=1, line_dash="dot", line_color="green", opacity=0.6)
                     fig.add_trace(go.Scatter(x=[target_dt], y=[tmp.loc[target_dt, 'Adj']], mode='markers', 
                                              marker=dict(color='green', size=10, symbol='star'), showlegend=False))
@@ -144,6 +155,7 @@ if not df.empty:
     with l_col:
         st.subheader("🔔 시스템 실행 로그")
         if logs: st.dataframe(pd.DataFrame(logs).sort_values("날짜", ascending=False), use_container_width=True, hide_index=True)
+        else: st.info("조건 충족 이력이 없습니다.")
     with d_col:
         st.subheader("💰 최근 분배금 이력")
         if not dividends.empty:
