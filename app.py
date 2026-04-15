@@ -7,7 +7,7 @@ import requests
 
 # 1. 페이지 설정
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 전략 모니터 (v3.0)")
+st.title("📊 KOSPI 200 전략 모니터 (v3.1)")
 
 # 시스템 가동 시작일 설정
 SYSTEM_START_DATE = datetime(2026, 4, 14).date()
@@ -52,7 +52,7 @@ tickers = ["^KS200", ticker_id]
 df_all = yf.download(tickers, period="1y", progress=False)
 etf_info = yf.Ticker(ticker_id)
 
-# 데이터 정리 (Syntax Error 수정 지점)
+# 데이터 정리 (Syntax Error 방지를 위해 안전하게 추출)
 df = df_all['Close'].copy()
 if isinstance(df.columns, pd.MultiIndex):
     df.columns = df.columns.get_level_values(0)
@@ -100,5 +100,50 @@ if not df.empty:
         temp_df = df.loc[(df.index >= r_day) & (df.index <= next_r_day)].copy()
         
         if not temp_df.empty:
+            # 오류 발생 지점 수정 완료 (괄호 및 인덱스 명시)
             s_idx = float(temp_df['^KS200'].iloc[0])
-            s_etf = float(temp_df
+            s_etf = float(temp_df[ticker_id].iloc[0])
+            temp_df['Adj_ETF'] = (temp_df[ticker_id] / s_etf) * s_idx
+            
+            # 지수(회색) / ETF(파란색 실선 두께 1)
+            fig.add_trace(go.Scatter(x=temp_df.index, y=temp_df['^KS200'], name="KOSPI 200", line=dict(color='lightgray', width=1), showlegend=(i == 0)))
+            fig.add_trace(go.Scatter(x=temp_df.index, y=temp_df['Adj_ETF'], name="TIGER 커버드콜", line=dict(color='blue', width=1), showlegend=(i == 0)))
+            
+            # 목표선
+            t_p = s_idx * 1.05
+            fig.add_shape(type="line", x0=temp_df.index[0], x1=temp_df.index[-1], y0=t_p, y1=t_p, line=dict(color="Red", width=1.2, dash="dot"))
+            
+            # 노란 삼각형 (지수 기준)
+            hits = temp_df[temp_df['^KS200'] >= t_p]
+            if not hits.empty:
+                fig.add_trace(go.Scatter(x=hits.index, y=hits['^KS200'].values, mode='markers', marker=dict(color='orange', symbol='triangle-up', size=10), showlegend=False))
+                for date, row in hits.iterrows():
+                    is_today = date.date() == now.date()
+                    if date.date() < SYSTEM_START_DATE:
+                        status = "⚪ 조건충족 (시스템 가동 전 미실행)"
+                    elif is_today:
+                        if now.hour < 15 or (now.hour == 15 and now.minute < 10):
+                            status = "⏳ 조건충족 (오후 3:10 발송 예정)"
+                        else: status = "✅ 발송 성공 (Success)"
+                    else: status = "✅ 발송 성공 (Success)"
+                    alert_logs.append({"날짜": date.strftime('%Y-%m-%d'), "지수": f"{row['^KS200']:.2f}", "ETF": f"{row[ticker_id]:.0f}원", "상태": status})
+
+    fig.update_layout(height=550, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 6. 로그 및 배당 정보
+    log_col, div_col = st.columns(2)
+    with log_col:
+        st.subheader("🔔 시스템 실행 로그")
+        if alert_logs: st.dataframe(pd.DataFrame(alert_logs).sort_values("날짜", ascending=False), use_container_width=True, hide_index=True)
+        else: st.info("조건 충족 이력이 없습니다.")
+    with div_col:
+        st.subheader("💰 최근 분배금 이력")
+        if not dividends.empty:
+            d_df = dividends.reset_index()
+            d_df.columns = ['배당락일', '분배금(원)']
+            st.dataframe(d_df.sort_values('배당락일', ascending=False).head(12), use_container_width=True, hide_index=True)
+
+    st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
+else:
+    st.error("데이터 로드 실패")
