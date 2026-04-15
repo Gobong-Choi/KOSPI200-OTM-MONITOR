@@ -7,8 +7,9 @@ import requests
 
 # 1. 페이지 설정
 st.set_page_config(page_title="KOSPI 200 전략 모니터", layout="wide")
-st.title("📊 KOSPI 200 전략 모니터 (v2.8: 정밀 지표 버전)")
+st.title("📊 KOSPI 200 전략 모니터 (v2.9: 지표 최적화 버전)")
 
+# 시스템 가동 시작일 (사용자 설정 반영)
 SYSTEM_START_DATE = datetime(2026, 4, 14).date()
 
 # 텔레그램 테스트 함수
@@ -52,101 +53,4 @@ df_all = yf.download(tickers, period="1y", progress=False)
 
 df = df_all['Close'].copy()
 if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.get_level_values(0)
-
-if not df.empty:
-    rebalance_days = get_rebalance_days(df.index)
-    
-    # 4. 현재 상태 요약 및 정밀 지표 계산
-    last_rebalance = rebalance_days[-1]
-    current_df = df.loc[df.index >= last_rebalance]
-    
-    base_price = float(current_df['^KS200'].iloc[0]) # 최근 리밸런싱 데이 종가
-    current_price = float(current_df['^KS200'].iloc[-1])
-    target_price = base_price * 1.05
-    profit_rate = ((current_price - base_price) / base_price) * 100
-
-    # 지표 영역 (4컬럼 레이아웃)
-    col1, col2, col3, col4 = st.columns(4)
-    
-    # [수정] 현재 지수 (리밸런싱 종가와의 차이 표시)
-    base_diff = current_price - base_price
-    col1.metric("현재 지수", f"{current_price:.2f}", 
-                delta=f"{base_diff:+.2f} (기준 대비)", delta_color="normal")
-    
-    # [신규] 리밸런싱 데이 기준 종가
-    col2.metric("기준 지수", f"{base_price:.2f}", 
-                help=f"최근 리밸런싱일({last_rebalance.strftime('%Y-%m-%d')})의 종가입니다.")
-    
-    # [수정] 목표 지수 (차이가 0 미만일 때 '초과 상태중' 표현)
-    target_diff = target_price - current_price
-    if target_diff <= 0:
-        target_label = "🔥 초과 상태 중"
-        t_delta_color = "normal"
-    else:
-        target_label = f"{target_diff:.2f} 남음"
-        t_delta_color = "inverse"
-        
-    col3.metric("목표 지수 (5%)", f"{target_price:.2f}", 
-                delta=target_label, delta_color=t_delta_color)
-    
-    # 현재 수익률
-    col4.metric("현재 수익률", f"{profit_rate:.2f}%")
-
-    # 5. 차트 시각화 (영점 조정 및 디자인 유지)
-    st.subheader("📈 지수 vs ETF 수익률 동기화 (영점 조정)")
-    fig = go.Figure()
-    alert_logs = []
-    now = datetime.now()
-
-    for i, r_day in enumerate(rebalance_days):
-        next_r_day = rebalance_days[i+1] if i + 1 < len(rebalance_days) else df.index[-1]
-        temp_df = df.loc[(df.index >= r_day) & (df.index <= next_r_day)].copy()
-        
-        if not temp_df.empty:
-            seg_idx_start = float(temp_df['^KS200'].iloc[0])
-            seg_etf_start = float(temp_df[ticker_id].iloc[0])
-            temp_df['Adj_ETF'] = (temp_df[ticker_id] / seg_etf_start) * seg_idx_start
-            
-            fig.add_trace(go.Scatter(x=temp_df.index, y=temp_df['^KS200'], name="KOSPI 200", line=dict(color='lightgray', width=1), showlegend=(i == 0)))
-            # [반영] 파란색 선 두께 줄임
-            fig.add_trace(go.Scatter(x=temp_df.index, y=temp_df['Adj_ETF'], name="TIGER 커버드콜", line=dict(color='blue', width=1), showlegend=(i == 0)))
-            
-            t_p = seg_idx_start * 1.05
-            fig.add_shape(type="line", x0=temp_df.index[0], x1=temp_df.index[-1], y0=t_p, y1=t_p, line=dict(color="Red", width=1.2, dash="dot"))
-            
-            hits = temp_df[temp_df['^KS200'] >= t_p]
-            if not hits.empty:
-                # [복구] 삼각형 마커
-                fig.add_trace(go.Scatter(x=hits.index, y=hits['^KS200'].values, mode='markers', marker=dict(color='orange', symbol='triangle-up', size=10), showlegend=False))
-                
-                for date, row in hits.iterrows():
-                    is_today = date.date() == now.date()
-                    if date.date() < SYSTEM_START_DATE:
-                        status = "⚪ 조건충족 (시스템 가동 전 미실행)"
-                    elif is_today:
-                        if now.hour < 15 or (now.hour == 15 and now.minute < 10):
-                            status = "⏳ 조건충족 (오후 3:10 발송 예정)"
-                        else: status = "✅ 발송 성공 (Success)"
-                    else: status = "✅ 발송 성공 (Success)"
-
-                    alert_logs.append({
-                        "날짜": date.strftime('%Y-%m-%d'),
-                        "지수": f"{row['^KS200']:.2f}",
-                        "ETF(실제)": f"{row[ticker_id]:.0f}원",
-                        "상태": status
-                    })
-
-    fig.update_layout(height=550, template="plotly_white", hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # 6. 로그 테이블
-    st.subheader("🔔 시스템 실행 로그 및 전송 상태")
-    if alert_logs:
-        log_df = pd.DataFrame(alert_logs).sort_values("날짜", ascending=False)
-        st.dataframe(log_df, use_container_width=True, hide_index=True)
-    else: st.info("조건 충족 이력이 없습니다.")
-
-    st.info(f"마지막 업데이트: {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
-else:
-    st.error("데이터 로드 실패")
+    df.columns = df.columns.
